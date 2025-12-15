@@ -1,8 +1,8 @@
 import os
-from typing import Dict, List, Tuple
+import time
+from typing import Optional, Tuple
 
 import joblib
-import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -12,16 +12,19 @@ from torchvision import datasets, models, transforms
 from tqdm import tqdm
 
 
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+
+
 def get_device() -> torch.device:
+    """Select CUDA if available."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
     return device
 
 
 def build_transforms(image_size: int) -> Tuple[transforms.Compose, transforms.Compose]:
-    imagenet_mean = [0.485, 0.456, 0.406]
-    imagenet_std = [0.229, 0.224, 0.225]
-
+    """Train/validation transforms with ImageNet normalization."""
     train_tf = transforms.Compose(
         [
             transforms.RandomHorizontalFlip(),
@@ -29,7 +32,8 @@ def build_transforms(image_size: int) -> Tuple[transforms.Compose, transforms.Co
             transforms.RandomResizedCrop(image_size, scale=(0.8, 1.0)),
             transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
             transforms.ToTensor(),
-            transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
+            transforms.RandomErasing(p=0.2, scale=(0.02, 0.33), value="random"),
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ]
     )
 
@@ -37,7 +41,7 @@ def build_transforms(image_size: int) -> Tuple[transforms.Compose, transforms.Co
         [
             transforms.Resize((image_size, image_size)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ]
     )
 
@@ -50,8 +54,9 @@ def build_dataloaders(
     batch_size: int,
     num_workers: int,
 ) -> Tuple[DataLoader, DataLoader, datasets.ImageFolder]:
+    """Create ImageFolder datasets and DataLoaders."""
     train_dir = os.path.join(data_dir, "train")
-    val_dir = os.path.join(data_dir, "valid")
+    val_dir = os.path.join(data_dir, "val")
 
     train_tf, val_tf = build_transforms(image_size=image_size)
 
@@ -65,154 +70,147 @@ def build_dataloaders(
 
 
 def build_model(num_classes: int, device: torch.device) -> nn.Module:
-    """EfficientNet-B4 backbone + custom classifier head."""
-    model = models.efficientnet_b4(weights=models.EfficientNet_B4_Weights.IMAGENET1K_V1)
+    """EfficientNet-B1 backbone + custom classifier head."""
+    model = models.efficientnet_b1(weights=models.EfficientNet_B1_Weights.IMAGENET1K_V1)
 
     for p in model.features.parameters():
         p.requires_grad = False
 
     in_features = model.classifier[1].in_features
     model.classifier = nn.Sequential(
-        nn.Dropout(0.3),
+        nn.Dropout(0.4),
         nn.Linear(in_features, num_classes),
     )
     return model.to(device)
 
 
-def train_one_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    optimizer: optim.Optimizer,
-    device: torch.device,
-    scaler: torch.cuda.amp.GradScaler,
-) -> Tuple[float, float]:
-    model.train()
-    running_loss, correct, total = 0.0, 0, 0
+def set_trainable_for_finetune(model: nn.Module, unfreeze_blocks: int = 2) -> None:
+    """
+    Unfreeze the last N blocks of EfficientNet feature extractor + keep classifier trainable.
+    EfficientNet.features is a Sequential of blocks; unfreezing too much may overfit.
+    """
+    for p in model.features.parameters():
+        p.requires_grad = False
+    for p in model.classifier.parameters():
+        p.requires_grad = True
 
-    for images, labels in tqdm(loader, desc="Train", ncols=100):
-        images, labels = images.to(device), labels.to(device)
-        optimizer.zero_grad(set_to_none=True)
-
-        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-
-        running_loss += loss.item() * images.size(0)
-        preds = outputs.argmax(dim=1)
-        correct += (preds == labels).sum().item()
-        total += labels.size(0)
-
-    return running_loss / max(total, 1), correct / max(total, 1)
+    if unfreeze_blocks > 0:
+        for p in model.features[-unfreeze_blocks:].parameters():
+            p.requires_grad = True
 
 
-@torch.no_grad()
-def validate_one_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-) -> Tuple[float, float]:
-    model.eval()
-    running_loss, correct, total = 0.0, 0, 0
-
-    for images, labels in loader:
-        images, labels = images.to(device), labels.to(device)
-        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-
-        running_loss += loss.item() * images.size(0)
-        preds = outputs.argmax(dim=1)
-        correct += (preds == labels).sum().item()
-        total += labels.size(0)
-
-    return running_loss / max(total, 1), correct / max(total, 1)
-
-
-def train_loop(
+def train_model(
     model: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
     criterion: nn.Module,
     optimizer: optim.Optimizer,
     scheduler: optim.lr_scheduler._LRScheduler,
-    device: torch.device,
     writer: SummaryWriter,
+    device: torch.device,
     num_epochs: int,
-    ckpt_path: str,
     stage_name: str,
-) -> Dict[str, List[float]]:
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    ckpt_path: str,
+    patience: int = 5,
+) -> None:
+    """Train with early stopping on validation loss."""
+    use_amp = device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    best_loss = float("inf")
     best_acc = 0.0
-    history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
+    patience_counter = 0
 
     for epoch in range(num_epochs):
-        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler)
-        val_loss, val_acc = validate_one_epoch(model, val_loader, criterion, device)
+        t0 = time.time()
 
-        history["train_loss"].append(train_loss)
-        history["val_loss"].append(val_loss)
-        history["train_acc"].append(train_acc)
-        history["val_acc"].append(val_acc)
+        # ---- Train ----
+        model.train()
+        running_loss, running_correct, running_total = 0.0, 0, 0
 
-        writer.add_scalar(f"{stage_name}/loss_train", train_loss, epoch + 1)
-        writer.add_scalar(f"{stage_name}/loss_val", val_loss, epoch + 1)
-        writer.add_scalar(f"{stage_name}/acc_train", train_acc, epoch + 1)
-        writer.add_scalar(f"{stage_name}/acc_val", val_acc, epoch + 1)
+        for images, labels in tqdm(train_loader, desc=f"{stage_name} Train {epoch+1}/{num_epochs}", ncols=100):
+            images, labels = images.to(device), labels.to(device)
+            optimizer.zero_grad(set_to_none=True)
 
-        if val_acc > best_acc:
-            best_acc = val_acc
-            torch.save(model.state_dict(), ckpt_path)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            running_loss += loss.item() * images.size(0)
+            preds = outputs.argmax(dim=1)
+            running_correct += (preds == labels).sum().item()
+            running_total += labels.size(0)
+
+        train_loss = running_loss / max(running_total, 1)
+        train_acc = running_correct / max(running_total, 1)
+
+        # ---- Validate ----
+        model.eval()
+        val_loss_sum, val_correct, val_total = 0.0, 0, 0
+        with torch.no_grad():
+            for images, labels in tqdm(val_loader, desc=f"{stage_name} Val {epoch+1}/{num_epochs}", ncols=100):
+                images, labels = images.to(device), labels.to(device)
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
+
+                val_loss_sum += loss.item() * images.size(0)
+                preds = outputs.argmax(dim=1)
+                val_correct += (preds == labels).sum().item()
+                val_total += labels.size(0)
+
+        val_loss = val_loss_sum / max(val_total, 1)
+        val_acc = val_correct / max(val_total, 1)
 
         scheduler.step()
+        lr = optimizer.param_groups[0]["lr"]
+        elapsed = time.time() - t0
+
+        # ---- Logging ----
+        writer.add_scalar(f"{stage_name}/Loss/train", train_loss, epoch + 1)
+        writer.add_scalar(f"{stage_name}/Loss/val", val_loss, epoch + 1)
+        writer.add_scalar(f"{stage_name}/Acc/train", train_acc, epoch + 1)
+        writer.add_scalar(f"{stage_name}/Acc/val", val_acc, epoch + 1)
+        writer.add_scalar(f"{stage_name}/LR", lr, epoch + 1)
 
         print(
             f"Epoch {epoch+1:03d}/{num_epochs:03d} | "
-            f"Train loss={train_loss:.4f} acc={train_acc:.4f} | "
-            f"Val loss={val_loss:.4f} acc={val_acc:.4f}"
+            f"time={elapsed:.1f}s lr={lr:.6f} | "
+            f"train loss={train_loss:.4f} acc={train_acc:.4f} | "
+            f"val loss={val_loss:.4f} acc={val_acc:.4f}"
         )
 
-    print(f"Best val acc ({stage_name}): {best_acc:.4f}")
-    return history
+        # ---- Early stopping (on val loss) + checkpoint ----
+        if val_loss < best_loss:
+            best_loss = val_loss
+            best_acc = val_acc
+            patience_counter = 0
+            torch.save(model.state_dict(), ckpt_path)
+            print(f"Saved best checkpoint: {ckpt_path} (val_loss={best_loss:.4f}, val_acc={best_acc:.4f})")
+        else:
+            patience_counter += 1
+            print(f"Early-stopping counter: {patience_counter}/{patience}")
 
+        if patience_counter >= patience:
+            print(f"Early stopping triggered (no val_loss improvement for {patience} epochs).")
+            break
 
-def plot_history(hist: Dict[str, List[float]], title: str) -> None:
-    epochs = range(1, len(hist["train_loss"]) + 1)
-    plt.figure(figsize=(12, 5))
-
-    plt.subplot(1, 2, 1)
-    plt.plot(epochs, hist["train_loss"], label="Train Loss")
-    plt.plot(epochs, hist["val_loss"], label="Val Loss")
-    plt.title(f"{title} Loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.legend()
-
-    plt.subplot(1, 2, 2)
-    plt.plot(epochs, hist["train_acc"], label="Train Acc")
-    plt.plot(epochs, hist["val_acc"], label="Val Acc")
-    plt.title(f"{title} Accuracy")
-    plt.xlabel("Epoch")
-    plt.ylabel("Accuracy")
-    plt.legend()
-
-    plt.tight_layout()
-    plt.show()
+    print(f"Done. Best val_acc={best_acc:.4f} | Best val_loss={best_loss:.4f}")
 
 
 def main() -> None:
-    data_dir = os.environ.get("DATA_DIR_MODEL2", "data/model2")
-    image_size = int(os.environ.get("IMAGE_SIZE_MODEL2", "380"))  # B4 default-like
-    batch_size = int(os.environ.get("BATCH_SIZE_MODEL2", "8"))
-    num_workers = int(os.environ.get("NUM_WORKERS", "0"))
-
     device = get_device()
     print(f"Device: {device}")
+
+    # Use env vars to avoid hard-coding local paths in the repo
+    data_dir = os.environ.get("DATA_DIR_MODEL1", "data/data")
+    image_size = int(os.environ.get("IMAGE_SIZE_MODEL1", "240"))
+    batch_size = int(os.environ.get("BATCH_SIZE_MODEL1", "8"))
+    num_workers = int(os.environ.get("NUM_WORKERS", "0"))
 
     train_loader, val_loader, train_ds = build_dataloaders(
         data_dir=data_dir,
@@ -222,81 +220,68 @@ def main() -> None:
     )
 
     num_classes = len(train_ds.classes)
-    print(f"Train images: {len(train_ds)} | Classes: {num_classes}")
-    print(f"Class mapping (ImageFolder): {train_ds.class_to_idx}")
+    print(f"Total images: {len(train_ds)} train | Classes: {num_classes}")
+    print(f"class_to_idx: {train_ds.class_to_idx}")
 
     model = build_model(num_classes=num_classes, device=device)
 
-    # NOTE: weights must follow ImageFolder class index order.
-    class_weights = torch.tensor(
-        [2.1700, 0.4519, 0.2961, 1.8037, 0.2783],
-        dtype=torch.float32,
-        device=device,
-    )
+    # IMPORTANT: weights must match train_ds.class_to_idx order.
+    # Example order: ["Coccidiosis", "Healthy", "New Castle Disease", "Salmonella"]
+    class_weights = torch.tensor([1.0, 0.8, 1.5, 1.5], dtype=torch.float32, device=device)
+
     criterion = nn.CrossEntropyLoss(weight=class_weights)
 
-    writer = SummaryWriter(log_dir="runs/efficientnet_b4_training")
+    writer = SummaryWriter(log_dir="runs/efficientnet_b1_improved")
 
-    # Stage 1: train classifier head
+    # Stage 1: classifier-head training (backbone frozen)
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
 
-    hist1 = train_loop(
+    train_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
         criterion=criterion,
         optimizer=optimizer,
         scheduler=scheduler,
-        device=device,
         writer=writer,
-        num_epochs=15,
-        ckpt_path="best_model_b4_stage1.pth",
+        device=device,
+        num_epochs=10,
         stage_name="stage1",
+        ckpt_path="best_model_b1_stage1.pth",
+        patience=5,
     )
 
-    # Stage 2: fine-tune tail blocks + classifier
-    for p in model.features.parameters():
-        p.requires_grad = False
-    for p in model.classifier.parameters():
-        p.requires_grad = True
-
-    for p in model.features[-3:].parameters():
-        p.requires_grad = True
+    # Stage 2: fine-tuning
+    set_trainable_for_finetune(model, unfreeze_blocks=2)
 
     optimizer = optim.AdamW(
         [
             {"params": model.features.parameters(), "lr": 1e-6},
-            {"params": model.classifier.parameters(), "lr": 1e-4},
+            {"params": model.classifier.parameters(), "lr": 1e-5},
         ],
         weight_decay=1e-5,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
 
-    hist2 = train_loop(
+    train_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
         criterion=criterion,
         optimizer=optimizer,
         scheduler=scheduler,
-        device=device,
         writer=writer,
-        num_epochs=200,
-        ckpt_path="best_model_b4_finetuned.pth",
+        device=device,
+        num_epochs=10,
         stage_name="finetune",
+        ckpt_path="best_model_b1_finetuned.pth",
+        patience=5,
     )
 
+    joblib.dump(train_ds.class_to_idx, "label_encoder_model1.pkl")
     writer.close()
-    joblib.dump(train_ds.class_to_idx, "label_encoder_model2.pkl")
-
-    merged = {
-        "train_loss": hist1["train_loss"] + hist2["train_loss"],
-        "val_loss": hist1["val_loss"] + hist2["val_loss"],
-        "train_acc": hist1["train_acc"] + hist2["train_acc"],
-        "val_acc": hist1["val_acc"] + hist2["val_acc"],
-    }
-    plot_history(merged, title="EfficientNet-B4")
+    print("Training finished. TensorBoard logs saved.")
 
 
 if __name__ == "__main__":
