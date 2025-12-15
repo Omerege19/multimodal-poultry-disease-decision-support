@@ -1,0 +1,303 @@
+import os
+from typing import Dict, List, Tuple
+
+import joblib
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from torchvision import datasets, models, transforms
+from tqdm import tqdm
+
+
+def get_device() -> torch.device:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.backends.cudnn.benchmark = True
+    return device
+
+
+def build_transforms(image_size: int) -> Tuple[transforms.Compose, transforms.Compose]:
+    imagenet_mean = [0.485, 0.456, 0.406]
+    imagenet_std = [0.229, 0.224, 0.225]
+
+    train_tf = transforms.Compose(
+        [
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(15),
+            transforms.RandomResizedCrop(image_size, scale=(0.8, 1.0)),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
+        ]
+    )
+
+    val_tf = transforms.Compose(
+        [
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
+        ]
+    )
+
+    return train_tf, val_tf
+
+
+def build_dataloaders(
+    data_dir: str,
+    image_size: int,
+    batch_size: int,
+    num_workers: int,
+) -> Tuple[DataLoader, DataLoader, datasets.ImageFolder]:
+    train_dir = os.path.join(data_dir, "train")
+    val_dir = os.path.join(data_dir, "valid")
+
+    train_tf, val_tf = build_transforms(image_size=image_size)
+
+    train_ds = datasets.ImageFolder(train_dir, transform=train_tf)
+    val_ds = datasets.ImageFolder(val_dir, transform=val_tf)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
+    return train_loader, val_loader, train_ds
+
+
+def build_model(num_classes: int, device: torch.device) -> nn.Module:
+    """EfficientNet-B4 backbone + custom classifier head."""
+    model = models.efficientnet_b4(weights=models.EfficientNet_B4_Weights.IMAGENET1K_V1)
+
+    for p in model.features.parameters():
+        p.requires_grad = False
+
+    in_features = model.classifier[1].in_features
+    model.classifier = nn.Sequential(
+        nn.Dropout(0.3),
+        nn.Linear(in_features, num_classes),
+    )
+    return model.to(device)
+
+
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: optim.Optimizer,
+    device: torch.device,
+    scaler: torch.cuda.amp.GradScaler,
+) -> Tuple[float, float]:
+    model.train()
+    running_loss, correct, total = 0.0, 0, 0
+
+    for images, labels in tqdm(loader, desc="Train", ncols=100):
+        images, labels = images.to(device), labels.to(device)
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        running_loss += loss.item() * images.size(0)
+        preds = outputs.argmax(dim=1)
+        correct += (preds == labels).sum().item()
+        total += labels.size(0)
+
+    return running_loss / max(total, 1), correct / max(total, 1)
+
+
+@torch.no_grad()
+def validate_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+) -> Tuple[float, float]:
+    model.eval()
+    running_loss, correct, total = 0.0, 0, 0
+
+    for images, labels in loader:
+        images, labels = images.to(device), labels.to(device)
+        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+
+        running_loss += loss.item() * images.size(0)
+        preds = outputs.argmax(dim=1)
+        correct += (preds == labels).sum().item()
+        total += labels.size(0)
+
+    return running_loss / max(total, 1), correct / max(total, 1)
+
+
+def train_loop(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: optim.Optimizer,
+    scheduler: optim.lr_scheduler._LRScheduler,
+    device: torch.device,
+    writer: SummaryWriter,
+    num_epochs: int,
+    ckpt_path: str,
+    stage_name: str,
+) -> Dict[str, List[float]]:
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    best_acc = 0.0
+    history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
+
+    for epoch in range(num_epochs):
+        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler)
+        val_loss, val_acc = validate_one_epoch(model, val_loader, criterion, device)
+
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["train_acc"].append(train_acc)
+        history["val_acc"].append(val_acc)
+
+        writer.add_scalar(f"{stage_name}/loss_train", train_loss, epoch + 1)
+        writer.add_scalar(f"{stage_name}/loss_val", val_loss, epoch + 1)
+        writer.add_scalar(f"{stage_name}/acc_train", train_acc, epoch + 1)
+        writer.add_scalar(f"{stage_name}/acc_val", val_acc, epoch + 1)
+
+        if val_acc > best_acc:
+            best_acc = val_acc
+            torch.save(model.state_dict(), ckpt_path)
+
+        scheduler.step()
+
+        print(
+            f"Epoch {epoch+1:03d}/{num_epochs:03d} | "
+            f"Train loss={train_loss:.4f} acc={train_acc:.4f} | "
+            f"Val loss={val_loss:.4f} acc={val_acc:.4f}"
+        )
+
+    print(f"Best val acc ({stage_name}): {best_acc:.4f}")
+    return history
+
+
+def plot_history(hist: Dict[str, List[float]], title: str) -> None:
+    epochs = range(1, len(hist["train_loss"]) + 1)
+    plt.figure(figsize=(12, 5))
+
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs, hist["train_loss"], label="Train Loss")
+    plt.plot(epochs, hist["val_loss"], label="Val Loss")
+    plt.title(f"{title} Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs, hist["train_acc"], label="Train Acc")
+    plt.plot(epochs, hist["val_acc"], label="Val Acc")
+    plt.title(f"{title} Accuracy")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.legend()
+
+    plt.tight_layout()
+    plt.show()
+
+
+def main() -> None:
+    data_dir = os.environ.get("DATA_DIR_MODEL2", "data/model2")
+    image_size = int(os.environ.get("IMAGE_SIZE_MODEL2", "380"))  # B4 default-like
+    batch_size = int(os.environ.get("BATCH_SIZE_MODEL2", "8"))
+    num_workers = int(os.environ.get("NUM_WORKERS", "0"))
+
+    device = get_device()
+    print(f"Device: {device}")
+
+    train_loader, val_loader, train_ds = build_dataloaders(
+        data_dir=data_dir,
+        image_size=image_size,
+        batch_size=batch_size,
+        num_workers=num_workers,
+    )
+
+    num_classes = len(train_ds.classes)
+    print(f"Train images: {len(train_ds)} | Classes: {num_classes}")
+    print(f"Class mapping (ImageFolder): {train_ds.class_to_idx}")
+
+    model = build_model(num_classes=num_classes, device=device)
+
+    # NOTE: weights must follow ImageFolder class index order.
+    class_weights = torch.tensor(
+        [2.1700, 0.4519, 0.2961, 1.8037, 0.2783],
+        dtype=torch.float32,
+        device=device,
+    )
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+    writer = SummaryWriter(log_dir="runs/efficientnet_b4_training")
+
+    # Stage 1: train classifier head
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
+
+    hist1 = train_loop(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=device,
+        writer=writer,
+        num_epochs=15,
+        ckpt_path="best_model_b4_stage1.pth",
+        stage_name="stage1",
+    )
+
+    # Stage 2: fine-tune tail blocks + classifier
+    for p in model.features.parameters():
+        p.requires_grad = False
+    for p in model.classifier.parameters():
+        p.requires_grad = True
+
+    for p in model.features[-3:].parameters():
+        p.requires_grad = True
+
+    optimizer = optim.AdamW(
+        [
+            {"params": model.features.parameters(), "lr": 1e-6},
+            {"params": model.classifier.parameters(), "lr": 1e-4},
+        ],
+        weight_decay=1e-5,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
+
+    hist2 = train_loop(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=device,
+        writer=writer,
+        num_epochs=200,
+        ckpt_path="best_model_b4_finetuned.pth",
+        stage_name="finetune",
+    )
+
+    writer.close()
+    joblib.dump(train_ds.class_to_idx, "label_encoder_model2.pkl")
+
+    merged = {
+        "train_loss": hist1["train_loss"] + hist2["train_loss"],
+        "val_loss": hist1["val_loss"] + hist2["val_loss"],
+        "train_acc": hist1["train_acc"] + hist2["train_acc"],
+        "val_acc": hist1["val_acc"] + hist2["val_acc"],
+    }
+    plot_history(merged, title="EfficientNet-B4")
+
+
+if __name__ == "__main__":
+    main()
